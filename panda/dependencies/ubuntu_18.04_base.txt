@@ -18,11 +18,12 @@ unzip
 # pyperipheral (only needed for armel)
 libpython3-dev
 
-# pypanda dependencies
+# panda python dependencies
 genisoimage
 libffi-dev
 python3-protobuf
 python3-colorama
+python3-capstone
 
 # apt-rdepends qemu-system-common
 acl
