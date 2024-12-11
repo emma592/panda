@@ -25,15 +25,31 @@ if [[ $# -eq 1 ]]; then
 	echo "	To build a package for current Ubuntu version:"
 	echo "	  $0"
 	echo "	To build a package for a specific OS/version (only Ubuntu supported for now):"
-	echo "	  $0 <OS> <version>"
+	echo "	  $0 <OS> <ubuntu-version> <tag-version>"
 	exit 1
 fi
 
 if [[ $# -eq 2 ]]; then
 	version=$2
-
 else
 	version=$(lsb_release -r | awk '{print $2}')
+fi
+
+if [[ $# -eq 3 ]]; then
+	tag_version=$3
+else
+	tag_version='v3.1.0'
+fi
+
+# Remove leading 'v' if present, e. g. v1.5.1 -> 1.5.1
+if [[ "$tag_version" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+    tag_version=${tag_version:1}
+fi
+
+# Check if the version follows the format X.Y.Z, e. g. 1.5.1 or 1.9.1
+if [[ ! "$tag_version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+    echo "ERROR: Version must be in the format X.Y.Z, provided tag version: $tag_version"
+    exit 1
 fi
 
 # Check if the given version is supported
@@ -42,18 +58,46 @@ if [[ ! -f "../dependencies/ubuntu_${version}_base.txt" ]]; then
 	exit 1
 fi
 
+# Check if HTTP_PROXY and HTTPS_PROXY are set, if not set them to blank
+HTTP_PROXY="${HTTP_PROXY:-}"
+HTTPS_PROXY="${HTTPS_PROXY:-}"
+
 # Build the installer to generate the wheel file
-DOCKER_BUILDKIT=1 docker build --target installer -t panda --build-arg BASE_IMAGE="ubuntu:${version}" ../..
+DOCKER_BUILDKIT=1 docker build \
+    --target installer \
+    -t panda_installer \
+    --build-arg HTTP_PROXY="${HTTP_PROXY}" \
+    --build-arg HTTPS_PROXY="${HTTPS_PROXY}" \
+    --build-arg BASE_IMAGE="ubuntu:${version}" \
+    ../..
 
 # Copy wheel file out of container to host
-# this also preserves wheel name, which is important as pip install WILL fail if you arbitarily change the generated wheel file name
-docker run --rm -v $(pwd):/out panda bash -c "cp /panda/panda/python/core/dist/*.whl /out"
+# This also preserves wheel name, which is important as pip install WILL fail if you arbitrarily change the generated wheel file name
+docker run --rm \
+    -v $(pwd):/out \
+    -e HTTP_PROXY="${HTTP_PROXY}" \
+    -e HTTPS_PROXY="${HTTPS_PROXY}" \
+    panda_installer \
+    bash -c "cp /panda/panda/python/core/dist/*.whl /out"
 
 # Finish building main panda container for the target ubuntu version
-DOCKER_BUILDKIT=1 docker build --target panda -t panda --build-arg BASE_IMAGE="ubuntu:${version}" ../..
+DOCKER_BUILDKIT=1 docker build \
+    --cache-from panda_installer \
+    --target panda \
+    -t panda \
+    --build-arg HTTP_PROXY="${HTTP_PROXY}" \
+    --build-arg HTTPS_PROXY="${HTTPS_PROXY}" \
+    --build-arg BASE_IMAGE="ubuntu:${version}" \
+    ../..
 
 # Now build the packager container from that
-docker build -t packager .
+DOCKER_BUILDKIT=1 docker build \
+    --cache-from panda \
+    -t packager \
+    --build-arg HTTP_PROXY="${HTTP_PROXY}" \
+    --build-arg HTTPS_PROXY="${HTTPS_PROXY}" \
+    --build-arg PACKAGE_VERSION="${tag_version}" \
+    .
 
 # Copy deb file out of container to host
 docker run --rm -v $(pwd):/out packager bash -c "cp /pandare.deb /out"

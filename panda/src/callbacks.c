@@ -12,6 +12,9 @@
  * See the COPYING file in the top-level directory.
  *
 PANDAENDCOMMENT */
+#include <stdio.h>
+#include <stdlib.h>
+#include <unistd.h>
 #include <stdint.h>
 #include <string.h>
 #include <dlfcn.h>
@@ -39,11 +42,24 @@ PANDAENDCOMMENT */
 #define LIBRARY_NAME "/libpanda-" TARGET_NAME ".so"
 #define PLUGIN_DIR "/" TARGET_NAME "-softmmu/panda/plugins/"
 
-#define INSTALL_PLUGIN_DIR "/usr/local/lib/panda/"
-#define INSTALL_BIN_DIR "/usr/local/bin/" // libpanda-arch.so and panda-system-arch in here
+const char* INSTALL_PLUGIN_DIR;
+const char* INSTALL_BIN_DIR; // libpanda-arch.so and panda-system-arch in here
 
 const gchar *panda_bool_true_strings[] =  {"y", "yes", "true", "1", NULL};
 const gchar *panda_bool_false_strings[] = {"n", "no", "false", "0", NULL};
+
+const char * panda_system_paths[] = {
+    "/usr/bin/panda-system-aarch64",
+    "/usr/bin/panda-system-arm",
+    "/usr/bin/panda-system-i386",
+    "/usr/bin/panda-system-mips",
+    "/usr/bin/panda-system-mips64",
+    "/usr/bin/panda-system-mips64el",
+    "/usr/bin/panda-system-mipsel",
+    "/usr/bin/panda-system-ppc",
+    "/usr/bin/panda-system-x86_64",
+    NULL
+};
 
 #if 0
 ###########################################################
@@ -151,6 +167,14 @@ static bool load_libpanda(void) {
             return libpanda != NULL;
         }
         g_free((char *)panda_lib);
+    }
+
+    INSTALL_BIN_DIR = "/usr/local/bin/";
+    for (int i = 0; panda_system_paths[i] != NULL; i++) {
+        if (access(panda_system_paths[i], F_OK) != -1) {
+            INSTALL_BIN_DIR = "/usr/bin";
+            break;
+        }
     }
 
     // Try standard install location
@@ -347,7 +371,14 @@ char* resolve_file_from_plugin_directory(const char* file_name_fmt, const char* 
         return plugin_path;
     }
     g_free(plugin_path);
-
+    
+    INSTALL_PLUGIN_DIR = "/usr/local/lib/panda/";
+    for (int i = 0; panda_system_paths[i] != NULL; i++) {
+        if (access(panda_system_paths[i], F_OK) != -1) {
+            INSTALL_PLUGIN_DIR = "/usr/lib/panda";
+            break;
+        }
+    }
 
     // Third, check relative to the standard install location.
     plugin_path = attempt_normalize_path(
