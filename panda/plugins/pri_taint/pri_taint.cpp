@@ -40,13 +40,11 @@ void uninit_plugin(void *);
 int get_loglevel() ;
 void set_loglevel(int new_loglevel);
 }
-bool linechange_taint = true;
-bool hypercall_taint = true;
-bool chaff_bugs = false;
-Panda__SrcInfoPri *si = NULL;
+
 const char *global_src_filename = NULL;
 uint64_t global_src_linenum;
 unsigned global_ast_loc_id;
+uint64_t global_funcaddr;
 bool debug = false;
 
 #define dprintf(...) if (debug) { printf(__VA_ARGS__); fflush(stdout); }
@@ -86,7 +84,7 @@ Addr make_greg(uint64_t r, uint16_t off) {
     return ra;
 }
 void print_membytes(CPUState *env, target_ulong a, target_ulong len) {
-    unsigned char c = (unsigned char)0;
+    unsigned char c = (unsigned char) 0;
     printf("{ ");
     for (int i = 0; i < len; i++) {
         if (-1 == panda_virtual_memory_read(env, a+i, (uint8_t *) &c, sizeof(char))) {
@@ -102,15 +100,34 @@ void print_membytes(CPUState *env, target_ulong a, target_ulong len) {
 #define LAVA_TAINT_QUERY_MAX_LEN (target_ulong)64ULL
 #if defined(TARGET_I386)
 void lava_taint_query(target_ulong buf, LocType loc_t, target_ulong buf_len, const char *astnodename) {
+    if (debug) {
+        printf("[pri_taint] Attempt to lava_taint_query\n");
+    }
+
     // can't do a taint query if it is not a valid register (loc) or if
     // the buf_len is greater than the register size (assume size of guest pointer)
     if (loc_t == LocReg && (buf >= CPU_NB_REGS || buf_len >= sizeof(target_ulong) ||
-                buf_len == (target_ulong)-1))
+                buf_len == (target_ulong) -1)) {
+        if (debug) {
+            printf("[pri_taint] The register is not balid OR buf_len > register size\n");
+        }
         return;
-    if (loc_t == LocErr || loc_t == LocConst)
+    }
+    if (loc_t == LocErr || loc_t == LocConst) {
+        if (debug) {
+            printf("[pri_taint] The Location is either error OR constant. Shouldn't happen based on pfun()\n");
+        }
         return;
-    if (!pandalog || !taint2_enabled() || taint2_num_labels_applied() == 0)
+    }
+    if (!pandalog || !taint2_enabled() || taint2_num_labels_applied() == 0) {
+        if (debug) {
+            printf("[pri_taint] No Panda log, Taint2 not enabled, or No taint2 num labeled applied\n");
+        }
         return;
+    }
+    if (debug) {
+        printf("[pri_taint] OK, Seems like I can Lava Taint! LFG!\n");
+    }
 
     CPUState *cpu = first_cpu;
     CPUArchState *env = (CPUArchState *)cpu->env_ptr;
@@ -118,10 +135,13 @@ void lava_taint_query(target_ulong buf, LocType loc_t, target_ulong buf_len, con
     hwaddr phys = loc_t == LocMem ? panda_virt_to_phys(cpu, buf) : 0;
     ram_addr_t RamOffset = RAM_ADDR_INVALID;
 
-    if (phys == (hwaddr)-1 || PandaPhysicalAddressToRamOffset(&RamOffset, phys, false) != MEMTX_OK) return;
+    if (phys == (hwaddr) -1 
+        || PandaPhysicalAddressToRamOffset(&RamOffset, phys, false) != MEMTX_OK) {
+        return;
+    }
 
     if (debug) {
-        printf("Querying \"%s\": " TARGET_FMT_lu " bytes @ 0x" TARGET_FMT_lx " phys 0x" TARGET_FMT_plx ", strnlen=%d", astnodename, buf_len, buf, phys, is_strnlen);
+        // printf("Querying \"%s\": " TARGET_FMT_lu " bytes @ 0x" TARGET_FMT_lx " phys 0x" TARGET_FMT_plx ", strnlen=%d", astnodename, buf_len, buf, phys, is_strnlen);
         print_membytes(cpu, buf, is_strnlen? 32 : buf_len);
         printf("\n");
     }
@@ -152,11 +172,22 @@ void lava_taint_query(target_ulong buf, LocType loc_t, target_ulong buf_len, con
     uint32_t num_tainted = 0;
     for (uint32_t i = 0; i < len; i++) {
         Addr a = loc_t == LocMem ? make_maddr(RamOffset + i) : make_greg(buf, i); /* HACK: presumes for the same physical page ram_addr_t(x + i) == ram_addr_t(x) + i */
-        if (taint2_query(a)) num_tainted++;
+        if (taint2_query(a)) {
+            num_tainted++;
+        }
     }
 
     // If nothing's tainted and we aren't doing chaff bugs, return.
-    if (!chaff_bugs && num_tainted == 0) return;
+    if (num_tainted == 0) {
+        if (debug) {
+            printf("[pri_taint] Nothing is tainted!\n");
+        }
+        return;
+    }
+
+    if (debug) {
+        printf("[pri_taint] Starting to write the Panda Log now in pri_taint\n");
+    }
 
     // 1. write the pandalog entry that tells us something was tainted on this extent
     Panda__TaintQueryPri tqh = PANDA__TAINT_QUERY_PRI__INIT;
@@ -180,6 +211,7 @@ void lava_taint_query(target_ulong buf, LocType loc_t, target_ulong buf_len, con
     // 2. iterate over the bytes in the extent and pandalog detailed info about taint
     std::vector<Panda__TaintQuery *> tq;
     for (uint32_t offset = 0; offset < len; offset++) {
+        // uint32_t pa_indexed = phys + offset;
         Addr a = loc_t == LocMem ? make_maddr(RamOffset + offset) : make_greg(buf, offset); /* HACK: presumes for the same physical page ram_addr_t(x + i) == ram_addr_t(x) + i */
         if (taint2_query(a)) {
             if (loc_t == LocMem) {
@@ -198,7 +230,7 @@ void lava_taint_query(target_ulong buf, LocType loc_t, target_ulong buf_len, con
     // 4. write out callstack info
     tqh.call_stack = pandalog_callstack_create();
 
-    dprintf("num taint queries: %lu\n", tq.size());
+    dprintf("[pri_taint] num taint queries: %lu\n", tq.size());
     tqh.n_taint_query = tq.size();
     tqh.taint_query = tq.data();
     Panda__LogEntry ple = PANDA__LOG_ENTRY__INIT;
@@ -207,7 +239,9 @@ void lava_taint_query(target_ulong buf, LocType loc_t, target_ulong buf_len, con
 
     pandalog_callstack_free(tqh.call_stack);
     free(tqh.src_info);
-    for (Panda__TaintQuery *ptq : tq) pandalog_taint_query_free(ptq);
+    for (Panda__TaintQuery *ptq : tq) {
+        pandalog_taint_query_free(ptq);
+    }
 }
 #endif
 struct args {
@@ -215,18 +249,25 @@ struct args {
     const char *src_filename;
     uint64_t src_linenum;
     unsigned ast_loc_id;
+    uint64_t funcaddr;
 };
 
 #if defined(TARGET_I386)
-void pfun(void *var_ty_void, const char *var_nm, LocType loc_t, target_ulong loc, void *in_args){
-    if (!taint2_enabled())
+void pfun(void *var_ty_void, const char *var_nm, LocType loc_t, target_ulong loc, void *in_args) {
+    if (!taint2_enabled()) {
+        if (debug) {
+            printf("[pri_taint] Taint2 was not enabled (pfun called)\n");
+        }
         return;
+    }
     // lava autogenerated variables start with this string
     const char *blacklist[] = {"kbcieiubweuhc", "phs", "phs_addr"} ;
     size_t i;
     for (i = 0; i < sizeof(blacklist)/sizeof(blacklist[0]); i++) {
         if (strncmp(var_nm, blacklist[i], strlen(blacklist[i])) == 0) {
-            //printf(" Found a lava generated string: %s", var_nm);
+            if (debug) {
+                printf("[pri_taint] Found a lava generated string: %s", var_nm);
+            }
             return;
         }
     }
@@ -239,18 +280,20 @@ void pfun(void *var_ty_void, const char *var_nm, LocType loc_t, target_ulong loc
     global_src_filename = args->src_filename;
     global_src_linenum = args->src_linenum;
     global_ast_loc_id = args->ast_loc_id;
+    global_funcaddr = args->funcaddr;
     //target_ulong guest_dword;
     //std::string ty_string = std::string(var_ty);
     //size_t num_derefs = std::count(ty_string.begin(), ty_string.end(), '*');
     //size_t i;
-    switch (loc_t){
+    switch (loc_t) {
         case LocReg:
-            dprintf("VAR REG:   %s %s in Reg " TARGET_FMT_lu "\n", var_ty, var_nm, loc);
+            dprintf("[pri_taint] VAR REG:   %s %s in Reg " TARGET_FMT_lu "\n", var_ty, var_nm, loc);
             dwarf2_type_iter(pfun_cpu, loc, loc_t, (DwarfVarType *) var_ty_void, lava_taint_query, 3);
             break;
         case LocMem:
-            if (debug)
-                printf("VAR MEM:   %s %s @ 0x" TARGET_FMT_lx "\n", var_ty, var_nm, loc);
+            if (debug) {
+                printf("[pri_taint] VAR MEM:   %s %s @ 0x" TARGET_FMT_lx "\n", var_ty, var_nm, loc);
+            }
             dwarf2_type_iter(pfun_cpu, loc, loc_t, (DwarfVarType *) var_ty_void, lava_taint_query, 3);
             break;
         case LocConst:
@@ -263,9 +306,9 @@ void pfun(void *var_ty_void, const char *var_nm, LocType loc_t, target_ulong loc
         default:
             assert(1==0);
     }
-    free(si);
+    // free(si);
 }
-
+/*
 void on_line_change(CPUState *cpu, target_ulong pc, const char *file_Name, const char *funct_name, unsigned long long lno){
     if (taint2_enabled()){
         struct args args = {cpu, file_Name, lno, 0};
@@ -280,21 +323,41 @@ void on_fn_start(CPUState *cpu, target_ulong pc, const char *file_Name, const ch
     pri_funct_livevar_iter(cpu, pc, (liveVarCB) pfun, (void *)&args);
 }
 
+// Trace logging in the level of source code
+void hypercall_log_trace(unsigned ast_loc_id) {
+    Panda__LogEntry ple = PANDA__LOG_ENTRY__INIT;
+    Panda__SourceTraceId stid = PANDA__SOURCE_TRACE_ID__INIT;
+    stid.ast_loc_id = ast_loc_id;
+    ple.source_trace_id = &stid;
+    pandalog_write_entry(&ple);
+}
+*/
 #ifdef TARGET_I386
 // Support all features of label and query program
-bool i386_hypercall_callback(CPUState *cpu){
+bool i386_hypercall_callback(CPUState *cpu) {
+    if (debug) {
+        printf("[pri_taint] Calling i386 hypercall callback!\n");
+    }
     bool ret = false;
     CPUArchState *env = (CPUArchState*)cpu->env_ptr;
-    if (taint2_enabled() && pandalog) {
+    if (taint2_enabled()) {
         // LAVA Hypercall
         target_ulong addr = panda_virt_to_phys(cpu, env->regs[R_EAX]);
         if ((int)addr == -1) {
-            printf ("panda hypercall with ptr to invalid PandaHypercallStruct: vaddr=0x%x paddr=0x%x\n",
+            printf ("[pri_taint] panda hypercall with ptr to invalid PandaHypercallStruct: vaddr=0x%x paddr=0x%x\n",
                     (uint32_t) env->regs[R_EAX], (uint32_t) addr);
         }
-        else {
+        else if (pandalog) {
+            if (debug) {
+                printf("[pri_taint] Hypercall is OK and Panda Log is set\n");
+            }
             PandaHypercallStruct phs;
-            panda_virtual_memory_rw(cpu, env->regs[R_EAX], (uint8_t *) &phs, sizeof(phs), false);
+            panda_virtual_memory_read(cpu, env->regs[R_EAX], (uint8_t *) &phs, sizeof(phs));
+
+            // To be used for chaff bugs?
+            uint64_t funcaddr = 0;
+            panda_virtual_memory_read(cpu, phs.info, (uint8_t*)&funcaddr, sizeof(target_ulong));
+
             if (phs.magic == 0xabcd) {
                 // if the phs action is a pri_query point, see
                 // lava/include/pirate_mark_lava.h
@@ -303,21 +366,41 @@ bool i386_hypercall_callback(CPUState *cpu){
                     SrcInfo info;
                     int rc = pri_get_pc_source_info(cpu, pc, &info);
                     if (!rc) {
-                        struct args args = {cpu, info.filename, info.line_number, phs.src_filename};
-                        dprintf("panda hypercall: [%s], "
+                        struct args args = {cpu, info.filename, info.line_number, phs.src_filename, funcaddr};
+                        dprintf("[pri_taint] panda hypercall: [%s], "
                                 "ln: %4ld, pc @ 0x" TARGET_FMT_lx "\n",
                                 info.filename,
                                 info.line_number,pc);
                         pri_funct_livevar_iter(cpu, pc, (liveVarCB) pfun, (void *)&args);
-                        //pri_all_livevar_iter(cpu, pc, (liveVarCB) pfun, (void *)&args);
                         //lava_attack_point(phs);
                     }
+                    else {
+                        if (debug) {
+                            printf("[pri_taint] pri_get_pc_src_info has failed: %d != 0.\n", rc);
+                        }
+                    }
                     ret = true;
+                    // hypercall_log_trace(phs.src_filename);
+                }
+                else {
+                    if (debug) {
+                        printf("[pri_taint] Invalid action value in PHS struct: %d != 13.\n", phs.action);
+                    }   
                 }
             }
             else {
-                printf ("Invalid magic value in PHS struct: %x != 0xabcd.\n", phs.magic);
+                printf("[pri_taint] Invalid magic value in PHS struct: %x != 0xabcd.\n", phs.magic);
             }
+        }
+        else {
+            if (debug) {
+                printf("[pri_taint] No Panda Log even though hypercall seemed OK!\n");
+            }
+        }
+    }
+    else {
+        if (debug) {
+            printf("[pri_taint] taint2 is not enabled (hypercall)\n");
         }
     }
     return ret;
@@ -325,7 +408,7 @@ bool i386_hypercall_callback(CPUState *cpu){
 #endif // TARGET_I386
 
 
-bool guest_hypercall_callback(CPUState *cpu){
+bool guest_hypercall_callback(CPUState *cpu) {
 #ifdef TARGET_I386
     return i386_hypercall_callback(cpu);
 #endif
@@ -354,33 +437,33 @@ bool init_plugin(void *self) {
 
 #if defined(TARGET_I386)
     panda_arg_list *args = panda_get_args("pri_taint");
-    hypercall_taint = panda_parse_bool_opt(args, "hypercall", "Register tainting on a panda hypercall callback");
-    linechange_taint = panda_parse_bool_opt(args, "linechange", "Register tainting on every line change in the source code (default)");
-    chaff_bugs = panda_parse_bool_opt(args, "chaff", "Record untainted extents for chaff bugs.");
-    // default linechange_taint to true if there is no hypercall taint
-    if (!hypercall_taint)
-        linechange_taint = true;
+    debug = panda_parse_bool_opt(args, "debug", "enable debug output"); 
+
     panda_require("callstack_instr");
     assert(init_callstack_instr_api());
     panda_require("pri");
     assert(init_pri_api());
     panda_require("dwarf2");
     assert(init_dwarf2_api());
-
     panda_require("taint2");
     assert(init_taint2_api());
 
-    if (hypercall_taint) {
-        panda_cb pcb;
-        pcb.guest_hypercall = guest_hypercall_callback;
-        panda_register_callback(self, PANDA_CB_GUEST_HYPERCALL, pcb);
+    panda_cb pcb;
+    pcb.guest_hypercall = guest_hypercall_callback;
+    panda_register_callback(self, PANDA_CB_GUEST_HYPERCALL, pcb);
+    printf("[pri_taint] This plugin is activated!\n");
+
+    // If taint isn't already enabled, turn it on.
+    if (!taint2_enabled()) {
+        printf("[pri_taint] enabling taint now!\n");
+        taint2_enable_taint();
     }
-    if (linechange_taint){
-        PPP_REG_CB("pri", on_before_line_change, on_line_change);
-    }
+    return true;
+#else
+    printf("[pri_taint] This plugin is only supported on x86\n");
+    return false;
     //taint2_track_taint_state();
 #endif
-    return true;
 }
 
 
